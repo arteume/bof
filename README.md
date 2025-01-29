@@ -1,4 +1,4 @@
-Box of Files: a tool for indexing files and directories
+Box of Files: a tool for indexing files and directories (deadlocks on parallel updating lol) 
 ```
 Usage: bof [OPTIONS] <COMMAND>
 
