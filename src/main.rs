@@ -1,5 +1,5 @@
 mod bof;
-use clap::{Subcommand,  Parser};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -12,12 +12,12 @@ struct Cli {
     output_dir: Option<PathBuf>,
     #[arg(long, help = "Set paths to ignore while indexing")]
     ignore_paths: Vec<PathBuf>,
-    #[arg(short='p', help = "Enable parallel processing")]
+    #[arg(short = 'p', help = "Enable parallel processing")]
     parallel: Option<bool>,
 }
 
 #[derive(Debug, Subcommand)]
-enum Commands  {
+enum Commands {
     #[command(about = "Creates a directory .bof for indexing")]
     Init,
 
@@ -27,23 +27,24 @@ enum Commands  {
         #[arg(help = "Directories' paths")]
         paths: Vec<PathBuf>,
     },
-
-    // #[command(arg_required_else_help = true)]
-    // #[command(about = "Update existing index")]
-    // Update {
-    //     #[arg(help = "Directories' paths to update")]
-    //     paths: Vec<PathBuf>,
-    // },
+    #[command(arg_required_else_help = true)]
+    #[command(about = "Update existing index")]
+    Update {
+        #[arg(help = "Directories' paths to update")]
+        paths: Vec<PathBuf>,
+    },
 }
 
 fn main() {
+    let now = std::time::Instant::now();
+
     let mut config = bof::load_config();
     let args = Cli::parse();
 
     if let Some(parallel) = args.parallel {
         config.parallel = parallel;
     }
-    
+
     if let Some(output_dir) = args.output_dir {
         config.output_dir = output_dir;
     }
@@ -63,10 +64,13 @@ fn main() {
                 println!("Error indexing directories: {}", e);
             }
         }
-        // Commands::Update { paths } => {
-        //     if let Err(e) = bof::update_directories_parallel(paths, bof_index.clone(), &config) {
-        //         println!("Error updating directories: {}", e);
-        //     }
-        // }
+        Commands::Update { paths } => {
+            if let Err(e) = bof::update_directories(paths, &config) {
+                println!("Error updating directories: {}", e);
+            }
+        }
     }
+
+    let elapsed = now.elapsed();
+    println!("Elapsed: {:.2?}", elapsed);
 }

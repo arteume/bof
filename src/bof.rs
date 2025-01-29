@@ -1,8 +1,15 @@
-use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use std::{collections::HashMap, fs::{self, File, Metadata}, os::unix::fs::MetadataExt, path::{Path, PathBuf}, io::{self}};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+use std::{
+    collections::HashMap,
+    fs::{self, File, Metadata},
+    io::{self},
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+};
 
 fn generate_key(ident: String) -> String {
     let mut hasher = Sha256::new();
@@ -10,40 +17,46 @@ fn generate_key(ident: String) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Debug)]
+enum QueueItem {
+    DirEntry(DirEntry),
+    BOFEntry(BOFEntry),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct BOFIndex {
     entries: Vec<BOFEntry>,
     inverse_table: HashMap<String, Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct BOFEntry {
     key: String,
-    path: String,
+    path: PathBuf,
     metadata: MetaData,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) enum MetaData {
     Directory(DirMetaData),
-    File(FileMetaData)
+    File(FileMetaData),
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub(crate) struct FileMetaData {
-    ctime: u64,
-    mtime: u64,
+    ctime: SystemTime,
+    mtime: SystemTime,
     size: u64,
     inode: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Deserialize, Debug, Serialize)]
 pub(crate) struct DirMetaData {
     data: Vec<DirEntry>,
     inode: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Deserialize, Debug, Serialize)]
 struct DirEntry {
     name: String,
     data: MetaData,
@@ -51,14 +64,9 @@ struct DirEntry {
 
 impl From<&Metadata> for FileMetaData {
     fn from(val: &Metadata) -> FileMetaData {
-        use std::time::UNIX_EPOCH;
         Self {
-            ctime: val.created()
-            .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs())
-            .unwrap(), // Should be supported in our system
-            mtime: val.modified()
-            .map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs())
-            .unwrap(), // Should be supported in our system
+            ctime: val.created().unwrap(),  // Should be supported in our system
+            mtime: val.modified().unwrap(), // Should be supported in our system
             size: val.len(),
             inode: val.ino(),
         }
@@ -73,22 +81,81 @@ impl BOFIndex {
         }
     }
 
-    fn add_entry(&mut self, path: &Path, key: String, metadata: &Metadata, dir_entries: Option<Vec<DirEntry>>) -> MetaData {
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_string_lossy().to_string();
+    fn add_entry(
+        &mut self,
+        path: &Path,
+        key: String,
+        metadata: &Metadata,
+        dir_entries: Option<Vec<DirEntry>>,
+    ) -> MetaData {
+        let parent_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .to_string();
 
         if metadata.is_file() {
             let metadata: FileMetaData = metadata.into();
-            self.entries.push(BOFEntry { 
-                key: key.clone(), path: path.to_string_lossy().to_string(), 
-                metadata: MetaData::File(metadata.clone()) });
-            self.inverse_table.entry(key).or_default().push( parent_dir);
+            self.entries.push(BOFEntry {
+                key: key.clone(),
+                path: path.to_path_buf(),
+                metadata: MetaData::File(metadata.clone()),
+            });
+            self.inverse_table.entry(key).or_default().push(parent_dir);
             MetaData::File(metadata)
+        } else {
+            MetaData::Directory(DirMetaData {
+                data: dir_entries.unwrap(), // Should be Some,
+                inode: metadata.ino(),
+            })
         }
-        else {
-        MetaData::Directory(DirMetaData {
-            data: dir_entries.unwrap(), // Should be Some,
-            inode: metadata.ino(),
-        })}
+    }
+
+    fn add_entry_meta(
+        &mut self,
+        path: &Path,
+        key: String,
+        metadata: &MetaData,
+        dir_entries: Option<Vec<DirEntry>>,
+    ) -> MetaData {
+        let parent_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .to_string();
+        match metadata {
+            MetaData::File(_) => {
+                self.entries.push(BOFEntry {
+                    key: key.clone(),
+                    path: path.to_path_buf(),
+                    metadata: metadata.clone(),
+                });
+                self.inverse_table.entry(key).or_default().push(parent_dir);
+                metadata.clone()
+            }
+            MetaData::Directory(dir_meta) => {
+                MetaData::Directory(DirMetaData {
+                    data: dir_entries.unwrap(), // Should be Some,
+                    inode: dir_meta.inode,
+                })
+            }
+        }
+    }
+
+    fn get_entry(&self, path: &Path) -> Option<MetaData> {
+        self.entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.metadata.clone())
+    }
+
+    fn update_entry(&mut self, path: &Path, key: String, metadata: &Metadata) -> MetaData {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.path == path) {
+            entry.key = key;
+            entry.metadata = MetaData::File(metadata.into());
+        }
+        println!("Updated an entry {}", path.display());
+        MetaData::File(metadata.into())
     }
 }
 
@@ -117,65 +184,40 @@ pub(crate) fn load_config() -> BOFConfig {
         .build()
         .unwrap();
 
-   settings.try_deserialize::<BOFConfig>().unwrap_or_default()
+    settings.try_deserialize::<BOFConfig>().unwrap_or_default()
 }
 
 pub(crate) fn init(config: &mut BOFConfig) -> io::Result<()> {
     fs::create_dir_all(&config.output_dir)?;
-    println!("Initialized .bof directory at: {}", &config.output_dir.display());
+    println!(
+        "Initialized .bof directory at: {}",
+        &config.output_dir.display()
+    );
     Ok(())
 }
 
-pub(crate) fn index(path: &Path, bof_index: &mut BOFIndex, config: &BOFConfig) -> io::Result<MetaData> {
+fn index(path: &Path, bof_index: &mut BOFIndex, config: &BOFConfig) -> io::Result<MetaData> {
     let metadata = fs::metadata(path)?;
     if !metadata.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a directory"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a directory",
+        ));
     }
 
     if config.ignore_paths.contains(&path.to_path_buf()) {
         println!("Skipping ignored path: {}", path.display());
-        return Ok(MetaData::Directory(DirMetaData { data: Vec::new(), inode: metadata.ino() }))
+        return Ok(MetaData::Directory(DirMetaData {
+            data: Vec::new(),
+            inode: metadata.ino(),
+        }));
     }
 
     let dir_key = generate_key(path.to_string_lossy().to_string());
-    let mut dir_entries = DirMetaData {data: Vec::new(), inode: metadata.ino()};
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = entry.path();
-
-        if config.ignore_paths.contains(&path.to_path_buf()) {
-            println!("Skipping ignored path: {}", path.display());
-            return Ok(MetaData::Directory(DirMetaData { data: Vec::new(), inode: metadata.ino() }))
-        }
-
-        if metadata.is_file() {
-            let key = generate_key(fs::read_to_string(&path)? + &name);
-            let file_meta = bof_index.add_entry(&path, key, &metadata, None);
-            dir_entries.data.push(DirEntry { name, data: file_meta });
-        } else if metadata.is_dir() {
-            let subdir_meta = index(&entry.path(), bof_index, config)?;
-            dir_entries.data.push(DirEntry { name, data: subdir_meta });
-        }
-    }
-    Ok(bof_index.add_entry(path, dir_key, &metadata, Some(dir_entries.data)))
-}
-
-pub(crate) fn index_parallel(path: &Path, bof_index: Arc<Mutex<BOFIndex>>, config: &BOFConfig) -> io::Result<MetaData> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a directory"));
-    }
-
-    if config.ignore_paths.contains(&path.to_path_buf()) {
-        println!("Skipping ignored path: {}", path.display());
-        return Ok(MetaData::Directory(DirMetaData { data: Vec::new(), inode: metadata.ino() }))
-    }
-
-    let dir_key = generate_key(path.to_string_lossy().to_string());
-    let dir_entries = Arc::new(Mutex::new(Vec::new()));
+    let mut dir_entries = DirMetaData {
+        data: Vec::new(),
+        inode: metadata.ino(),
+    };
 
     fs::read_dir(path)?
         .inspect(|entry| {
@@ -184,215 +226,441 @@ pub(crate) fn index_parallel(path: &Path, bof_index: Arc<Mutex<BOFIndex>>, confi
             }
         })
         .filter_map(|e| e.ok())
-        .par_bridge()
         .for_each(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
             let path = entry.path();
-            let metadata = entry.metadata();
-
-            if let Ok(metadata) = metadata {
-                if config.ignore_paths.contains(&path.to_path_buf()) {
-                    println!("Skipping ignored path: {}", path.display());
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Failed to get metadata for {}: {}", path.display(), e);
                     return;
                 }
+            };
 
-                if metadata.is_file() {
-                    let key = generate_key(path.to_string_lossy().to_string());
-                    let file_meta = {
-                        let mut index = bof_index.lock().unwrap();
-                        index.add_entry(&path, key, &metadata, None)
-                    };
-                    dir_entries.lock().unwrap().push(DirEntry { name, data: file_meta });
-                } else if metadata.is_dir() {
-                    if let Ok(subdir_meta) = index_parallel(&path, bof_index.clone(), config) {
-                        dir_entries.lock().unwrap().push(DirEntry { name, data: subdir_meta });
+            if config.ignore_paths.contains(&path.to_path_buf()) {
+                println!("Skipping ignored path: {}", path.display());
+                return;
+            }
+
+            if metadata.is_file() {
+                let key = match fs::read_to_string(&path) {
+                    Ok(content) => generate_key(content + &name),
+                    Err(e) => {
+                        eprintln!("Failed to read file {}: {}", path.display(), e);
+                        return;
+                    }
+                };
+                let file_meta = bof_index.add_entry(&path, key, &metadata, None);
+                dir_entries.data.push(DirEntry {
+                    name,
+                    data: file_meta,
+                });
+            } else if metadata.is_dir() {
+                match index(&entry.path(), bof_index, config) {
+                    Ok(subdir_meta) => dir_entries.data.push(DirEntry {
+                        name,
+                        data: subdir_meta,
+                    }),
+                    Err(e) => eprintln!("Failed to index directory {}: {}", path.display(), e),
+                };
+            } else {
+                eprintln!("Neither file nor directory! {}", path.display());
+                return;
+            }
+        });
+
+    Ok(bof_index.add_entry(path, dir_key, &metadata, Some(dir_entries.data)))
+}
+
+fn index_parallel(
+    path: &Path,
+    bof_index: Arc<Mutex<BOFIndex>>,
+    config: &BOFConfig,
+) -> io::Result<MetaData> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a directory",
+        ));
+    }
+
+    if config.ignore_paths.contains(&path.to_path_buf()) {
+        println!("Skipping ignored path: {}", path.display());
+        return Ok(MetaData::Directory(DirMetaData {
+            data: Vec::new(),
+            inode: metadata.ino(),
+        }));
+    }
+
+    let dir_key = generate_key(path.to_string_lossy().to_string());
+    let queue = crossbeam_queue::SegQueue::new();
+
+    let entries = fs::read_dir(path)?
+        .inspect(|entry| {
+            if let Err(ref e) = entry {
+                eprintln!("Invalid entry in directory {}: {}", path.display(), e);
+            }
+        })
+        .filter_map(|e| e.ok())
+        .collect::<Vec<_>>();
+
+    entries.par_iter().for_each(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to get metadata for {}: {}", path.display(), e);
+                return;
+            }
+        };
+
+        if config.ignore_paths.contains(&path.to_path_buf()) {
+            println!("Skipping ignored path: {}", path.display());
+            return;
+        }
+
+        if metadata.is_file() {
+            let key = match fs::read_to_string(&path) {
+                Ok(content) => generate_key(content + &name),
+                Err(e) => {
+                    eprintln!("Failed to read file {}: {}", path.display(), e);
+                    return;
+                }
+            };
+            let file_meta = FileMetaData::from(&metadata);
+            queue.push(QueueItem::DirEntry(DirEntry {
+                name,
+                data: MetaData::File(file_meta.clone()),
+            }));
+
+            let bof_entry = BOFEntry {
+                key,
+                path: path.clone(),
+                metadata: MetaData::File(file_meta),
+            };
+            queue.push(QueueItem::BOFEntry(bof_entry));
+        } else if metadata.is_dir() {
+            match index_parallel(&path, bof_index.clone(), config) {
+                Ok(subdir_meta) => queue.push(QueueItem::DirEntry(DirEntry {
+                    name,
+                    data: subdir_meta,
+                })),
+                Err(e) => eprintln!("Failed to index directory {}: {}", path.display(), e),
+            };
+        } else {
+            eprintln!("Neither file nor directory! {}", path.display());
+            return;
+        }
+    });
+
+    let mut index_lock = bof_index.lock().unwrap();
+    let mut dir_entries = Vec::new();
+
+    while let Some(item) = queue.pop() {
+        match item {
+            QueueItem::DirEntry(entry) => dir_entries.push(entry),
+            QueueItem::BOFEntry(bof_entry) => {
+                index_lock.add_entry_meta(
+                    &bof_entry.path,
+                    bof_entry.key,
+                    &bof_entry.metadata,
+                    None,
+                );
+            }
+        }
+    }
+
+    let meta_data = MetaData::Directory(DirMetaData {
+        data: dir_entries.clone(),
+        inode: metadata.ino(),
+    });
+
+    index_lock.add_entry(path, dir_key, &metadata, Some(dir_entries));
+    Ok(meta_data)
+}
+
+pub(crate) fn index_directories(paths: Vec<PathBuf>, config: &BOFConfig) -> io::Result<()> {
+    let bof_index = Arc::new(Mutex::new(BOFIndex::new()));
+
+    if config.parallel {
+        paths.par_iter().for_each(|path| {
+            if let Err(e) = index_parallel(path, bof_index.clone(), config) {
+                eprintln!("Error indexing directory {}: {}", path.display(), e);
+            }
+        });
+
+        let bof_index_lock = bof_index.lock().unwrap();
+        save_index((*bof_index_lock).clone(), config)
+    } else {
+        let mut bof_index = BOFIndex::new();
+        for path in paths {
+            index(&path, &mut bof_index, config)?;
+        }
+        save_index(bof_index, config)
+    }
+}
+
+fn update_index(path: &Path, bof_index: &mut BOFIndex, config: &BOFConfig) -> io::Result<MetaData> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a directory",
+        ));
+    }
+
+    if config.ignore_paths.contains(&path.to_path_buf()) {
+        println!("Skipping ignored path: {}", path.display());
+        return Ok(MetaData::Directory(DirMetaData {
+            data: Vec::new(),
+            inode: metadata.ino(),
+        }));
+    }
+
+    let dir_key = generate_key(path.to_string_lossy().to_string());
+    let mut dir_entries = DirMetaData {
+        data: Vec::new(),
+        inode: metadata.ino(),
+    };
+
+    fs::read_dir(path)?
+        .inspect(|entry| {
+            if let Err(ref e) = entry {
+                eprintln!("Invalid entry in directory {}: {}", path.display(), e);
+            }
+        })
+        .filter_map(|e| e.ok())
+        .for_each(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Failed to get metadata for {}: {}", path.display(), e);
+                    return;
+                }
+            };
+
+            match bof_index.get_entry(&path) {
+                Some(MetaData::Directory(_)) => {
+                    eprintln!("This entry is a directory! {}", path.display());
+                }
+                Some(MetaData::File(file_meta)) => {
+                    if file_meta.mtime != metadata.modified().unwrap() {
+                        let key = match fs::read_to_string(&path) {
+                            Ok(content) => generate_key(content + &name),
+                            Err(e) => {
+                                eprintln!("Failed to read file {}: {}", path.display(), e);
+                                return;
+                            }
+                        };
+                        bof_index.update_entry(&path, key, &metadata);
+                    }
+                }
+                None => {
+                    if metadata.is_file() {
+                        let key = match fs::read_to_string(&path) {
+                            Ok(content) => generate_key(content + &name),
+                            Err(e) => {
+                                eprintln!("Failed to read file {}: {}", path.display(), e);
+                                return;
+                            }
+                        };
+                        let file_meta = bof_index.add_entry(&path, key, &metadata, None);
+                        dir_entries.data.push(DirEntry {
+                            name,
+                            data: file_meta,
+                        });
+                    } else if metadata.is_dir() {
+                        println!("hi");
+                        if let Ok(subdir_meta) = update_index(&path, &mut bof_index.clone(), config)
+                        {
+                            dir_entries.data.push(DirEntry {
+                                name,
+                                data: subdir_meta,
+                            });
+                        }
+                    } else {
+                        eprintln!("Neither file nor directory! {}", path.display());
+                        return;
                     }
                 }
             }
         });
+    if let Some(entry) = bof_index.entries.iter().find(|entry| entry.path == path) {
+        Ok(entry.metadata.clone())
+    } else {
+        Ok(bof_index.add_entry(path, dir_key, &metadata, Some(dir_entries.data)))
+    }
+}
 
-    let dir_entries = Arc::try_unwrap(dir_entries).unwrap().into_inner().unwrap();
+fn update_index_parallel(
+    path: &Path,
+    bof_index: Arc<Mutex<BOFIndex>>,
+    config: &BOFConfig,
+) -> io::Result<MetaData> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Path is not a directory",
+        ));
+    }
+
+    if config.ignore_paths.contains(&path.to_path_buf()) {
+        println!("Skipping ignored path: {}", path.display());
+        return Ok(MetaData::Directory(DirMetaData {
+            data: Vec::new(),
+            inode: metadata.ino(),
+        }));
+    }
+
+    let dir_key = generate_key(path.to_string_lossy().to_string());
+    let queue = crossbeam_queue::SegQueue::new();
+
+    let entries = fs::read_dir(path)?
+        .inspect(|entry| {
+            if let Err(ref e) = entry {
+                eprintln!("Invalid entry in directory {}: {}", path.display(), e);
+            }
+        })
+        .filter_map(|e| e.ok())
+        .collect::<Vec<_>>();
+
+    entries.par_iter().for_each(|entry| {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to get metadata for {}: {}", path.display(), e);
+                return;
+            }
+        };
+
+        let mut index_lock = bof_index.lock().unwrap();
+        match index_lock.get_entry(&path) {
+            Some(MetaData::Directory(_)) => {
+                eprintln!("This entry is a directory! {}", path.display());
+                return;
+            }
+            Some(MetaData::File(file_meta)) => {
+                if file_meta.mtime != metadata.modified().unwrap() {
+                    let key = match fs::read_to_string(&path) {
+                        Ok(content) => generate_key(content + &name),
+                        Err(e) => {
+                            eprintln!("Failed to read file {}: {}", path.display(), e);
+                            return;
+                        }
+                    };
+
+                    index_lock.update_entry(&path, key, &metadata);
+                }
+            }
+            None => {
+                if metadata.is_file() {
+                    let key = match fs::read_to_string(&path) {
+                        Ok(content) => generate_key(content + &name),
+                        Err(e) => {
+                            eprintln!("Failed to read file {}: {}", path.display(), e);
+                            return;
+                        }
+                    };
+                    let file_meta = FileMetaData::from(&metadata);
+                    queue.push(QueueItem::DirEntry(DirEntry {
+                        name,
+                        data: MetaData::File(file_meta.clone()),
+                    }));
+
+                    let bof_entry = BOFEntry {
+                        key,
+                        path: path.clone(),
+                        metadata: MetaData::File(file_meta),
+                    };
+                    queue.push(QueueItem::BOFEntry(bof_entry));
+                } else if metadata.is_dir() {
+                    println!("hi");
+                    if let Ok(subdir_meta) = update_index_parallel(&path, bof_index.clone(), config)
+                    {
+                        queue.push(QueueItem::DirEntry(DirEntry {
+                            name,
+                            data: subdir_meta,
+                        }));
+                    }
+                } else {
+                    eprintln!("Neither file nor directory! {}", path.display());
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut index_lock = bof_index.lock().unwrap();
+    let mut dir_entries = Vec::new();
+
+    while let Some(item) = queue.pop() {
+        match item {
+            QueueItem::DirEntry(entry) => dir_entries.push(entry),
+            QueueItem::BOFEntry(bof_entry) => {
+                index_lock.add_entry_meta(
+                    &bof_entry.path,
+                    bof_entry.key,
+                    &bof_entry.metadata,
+                    None,
+                );
+            }
+        }
+    }
 
     let meta_data = {
         let mut index = bof_index.lock().unwrap();
-        index.add_entry(path, dir_key, &metadata, Some(dir_entries))
+        if let Some(entry) = index.entries.iter().find(|entry| entry.path == path) {
+            entry.metadata.clone()
+        } else {
+            index.add_entry(path, dir_key, &metadata, Some(dir_entries))
+        }
     };
 
     Ok(meta_data)
 }
 
-pub(crate) fn index_directories(paths: Vec<PathBuf>, config: &BOFConfig) -> io::Result<()> {
-    let bof_indices = Arc::new(Mutex::new(Vec::new()));
+pub(crate) fn update_directories(paths: Vec<PathBuf>, config: &BOFConfig) -> io::Result<()> {
+    let mut existing_indices = load_indices(&config.output_dir)?;
 
     if config.parallel {
         paths.par_iter().for_each(|path| {
-            let bof_index = BOFIndex::new();
-            if let Err(e) = index_parallel(&path, Arc::new(Mutex::new(bof_index.clone())), config) {
-                eprintln!("Error indexing directory {}: {}", path.display(), e);
-            }
-
-            bof_indices.lock().unwrap().push(bof_index);
-        });
-    } else {
-        for path in paths {
-            let mut bof_index = BOFIndex::new();
-            index(&path, &mut bof_index, config)?;
-            bof_indices.lock().unwrap().push(bof_index);
-        }
-    }
-
-    let bof_indices_lock = bof_indices.lock().unwrap();
-    save_indices(bof_indices_lock.clone(), config)
-}
-
-pub(crate) fn update_index(path: &Path, bof_index: &mut BOFIndex, config: &BOFConfig) -> io::Result<()> {
-    let metadata = fs::metadata(path)?;
-    let key = generate_key(path.to_string_lossy().to_string());
-
-    // Check if the entry exists
-    if let Some(entry) = bof_index.entries.iter_mut().find(|entry| entry.key == key) {
-        if metadata.is_file() {
-            let file_meta: FileMetaData = (&metadata).into();
-            if let MetaData::File(existing_meta) = &entry.metadata {
-                if file_meta.mtime > existing_meta.mtime {
-                    // File has been modified
-                    entry.metadata = MetaData::File(file_meta);
-                }
-            }
-        } else if metadata.is_dir() {
-            // For directories, recursively update sub-entries
-            let sub_entries = fs::read_dir(path)?
-                .map(|entry| entry.map(|e| e.path()))
-                .collect::<Result<Vec<PathBuf>, io::Error>>()?;
-            for sub_path in sub_entries {
-                update_index(&sub_path, bof_index, config)?;
-            }
-        }
-    } else {
-        // Entry doesn't exist, add it to the index
-        index(path, bof_index, config)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn update_index_parallel(path: &Path, bof_index: Arc<Mutex<BOFIndex>>, config: &BOFConfig) -> io::Result<MetaData> {
-    let metadata = fs::metadata(path)?;
-    let key = generate_key(path.to_string_lossy().to_string());
-
-    // Check if the entry exists
-    if let Some(entry) = bof_index.lock().unwrap().entries.iter_mut().find(|entry| entry.key == key) {
-        if metadata.is_file() {
-            let file_meta: FileMetaData = (&metadata).into();
-            if let MetaData::File(existing_meta) = &entry.metadata {
-                if file_meta.mtime > existing_meta.mtime {
-                    // File has been modified, update it
-                    entry.metadata = MetaData::File(file_meta);
-                }
-            }
-        } else if metadata.is_dir() {
-            // For directories, recursively update sub-entries in parallel
-            let sub_entries = fs::read_dir(path)?
-                .map(|entry| entry.map(|e| e.path()))
-                .collect::<Result<Vec<PathBuf>, io::Error>>()?;
-
-            // Parallel processing of subdirectory entries
-            sub_entries.par_iter().for_each(|sub_path| {
-                if let Err(e) = update_index_parallel(sub_path, bof_index.clone(), config) {
-                    println!("Error updating index for {}: {}", sub_path.to_string_lossy(), e);
-                }
-            });
-        }
-    } else {
-        // Entry doesn't exist, add it to the index
-        let dir_key = generate_key(path.to_string_lossy().to_string());
-        let dir_entries = Arc::new(Mutex::new(Vec::new()));
-        let entries: Vec<_> = fs::read_dir(path)?
-            .filter_map(|entry| entry.ok())
-            .collect();
-
-        // Parallel directory processing
-        fs::read_dir(path)?
-            .filter_map(|entry| entry.ok()) // Ignore invalid entries
-            .par_bridge() // Converts the iterator into a parallel iterator
-            .for_each(|entry| {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path();
-                let metadata = entry.metadata();
-
-                if let Ok(metadata) = metadata {
-                    if metadata.is_file() {
-                        // Process files
-                        let key = generate_key(path.to_string_lossy().to_string());
-                        let file_meta = {
-                            let mut index = bof_index.lock().unwrap();
-                            index.add_entry(&path, key, &metadata, None)
-                        };
-                        dir_entries.lock().unwrap().push(DirEntry { name, data: file_meta });
-                    } else if metadata.is_dir() {
-                        if let Ok(subdir_meta) = update_index_parallel(&path, bof_index.clone(), config) {
-                            dir_entries.lock().unwrap().push(DirEntry { name, data: subdir_meta });
-                        }
-                    }
-                }
-            });
-
-        let dir_entries = Arc::try_unwrap(dir_entries).unwrap().into_inner().unwrap();
-
-        // Add directory entry after parallel processing
-        let meta_data = {
-            let mut index = bof_index.lock().unwrap();
-            index.add_entry(path, dir_key, &metadata, Some(dir_entries))
-        };
-
-        return Ok(meta_data);
-    }
-
-    Ok(MetaData::Directory(DirMetaData { data: Vec::new(), inode: metadata.ino() }))
-}
-
-pub(crate) fn update_directories_parallel(
-    paths: Vec<PathBuf>,
-    bof_index: Arc<Mutex<BOFIndex>>,
-    config: &BOFConfig,
-) -> io::Result<()> {
-    if config.parallel {
-        // Parallelize directory updates
-        paths.into_par_iter().for_each(|path| {
-            if let Err(e) = update_index_parallel(&path, bof_index.clone(), config) {
-                println!("Error updating index for {}: {}", path.to_string_lossy(), e);
+            if let Err(e) =
+                update_index_parallel(path, Arc::new(Mutex::new(existing_indices.clone())), config)
+            {
+                eprintln!("Error updating directory {}: {}", path.display(), e);
             }
         });
+        save_index(existing_indices, config)
     } else {
-        // Sequential update if parallel is not enabled
+        let mut bof_indices = Vec::new();
         for path in paths {
-            if let Err(e) = update_index(&path, &mut bof_index.lock().unwrap(), config) {
-                println!("Error updating index for {}: {}", path.to_string_lossy(), e);
-            }
+            update_index(&path, &mut existing_indices, config)?;
+            bof_indices.push(existing_indices.clone());
         }
+        save_index(existing_indices, config)
     }
-
-    Ok(())
 }
 
-pub(crate) fn save_indices(bof_indices: Vec<BOFIndex>, config: &BOFConfig) -> io::Result<()> {
-    let mut global_entries = Vec::new();
-    let mut global_inverse_table = HashMap::new();
-
-    for bof_index in bof_indices {
-        global_entries.extend(bof_index.entries);
-        for (key, value) in bof_index.inverse_table {
-            global_inverse_table
-                .entry(key)
-                .or_insert_with(Vec::new)
-                .extend(value); 
-        }
-    }
-
-    let global_bof = BOFIndex { entries: global_entries, inverse_table: global_inverse_table };
-
-    let file = File::create(&config.output_dir.join(PathBuf::from("index.json")))?;
-    serde_json::to_writer_pretty(file, &global_bof)?;
+pub(crate) fn save_index(bof_indices: BOFIndex, config: &BOFConfig) -> io::Result<()> {
+    let file = File::create(config.output_dir.join(PathBuf::from("index.json")))?;
+    serde_json::to_writer_pretty(file, &bof_indices)?;
     println!("BOF saved to {}/index.json", config.output_dir.display());
 
     Ok(())
+}
+
+pub fn load_indices(output_dir: &Path) -> io::Result<BOFIndex> {
+    let path = output_dir.join("index.json");
+
+    let file = File::open(path)?;
+    let index = serde_json::from_reader(file)?;
+
+    Ok(index)
 }
