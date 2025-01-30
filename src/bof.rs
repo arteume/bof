@@ -690,7 +690,7 @@ pub fn load_indices(output_dir: &Path) -> io::Result<BOFIndex> {
     let entries_map: HashMap<PathBuf, BOFEntry> = entries
         .entries
         .into_iter()
-        .map(|entry| (PathBuf::from(entry.path.clone()), entry))
+        .map(|entry| (entry.path.clone(), entry))
         .collect();
 
     Ok(BOFIndex {
