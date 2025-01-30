@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    #[command(about = "Creates a directory .bof for indexing")]
+    #[command(about = "Create a directory .bof for indexing")]
     Init,
 
     #[command(arg_required_else_help = true)]
