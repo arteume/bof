@@ -6,7 +6,7 @@ Box of Files: a tool for indexing files and directories
 Usage: bof [OPTIONS] <COMMAND>
 
 Commands:
-init    Creates a directory .bof for indexing
+init    Create a directory .bof for indexing
 index   Index directories
 update  Update existing index
 help    Print this message or the help of the given subcommand(s)
