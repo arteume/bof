@@ -655,13 +655,13 @@ pub(crate) fn update_directories(paths: Vec<PathBuf>, config: &BOFConfig) -> io:
     }
 }
 
-pub(crate) fn save_index(bof_indices: BOFIndex, config: &BOFConfig) -> io::Result<()> {
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    struct IntBOFIndex {
-        entries: Vec<BOFEntry>,
-        inverse_table: HashMap<String, Vec<PathBuf>>,
-    }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IntBOFIndex {
+    entries: Vec<BOFEntry>,
+    inverse_table: HashMap<String, Vec<PathBuf>>,
+}
 
+pub(crate) fn save_index(bof_indices: BOFIndex, config: &BOFConfig) -> io::Result<()> {
     let file = File::create(config.output_dir.join(PathBuf::from("index.json")))?;
     serde_json::to_writer_pretty(
         file,
@@ -676,12 +676,6 @@ pub(crate) fn save_index(bof_indices: BOFIndex, config: &BOFConfig) -> io::Resul
 }
 
 pub fn load_indices(output_dir: &Path) -> io::Result<BOFIndex> {
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    struct IntBOFIndex {
-        entries: Vec<BOFEntry>,
-        inverse_table: HashMap<String, Vec<PathBuf>>,
-    }
-
     let path = output_dir.join("index.json");
     let file = File::open(path)?;
 
