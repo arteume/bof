@@ -1,7 +1,6 @@
 Box of Files: a tool for indexing files and directories 
 
 - deadlocks on parallel updating
-- updating command is slower than indexing :-( 
 ```
 Usage: bof [OPTIONS] <COMMAND>
 
